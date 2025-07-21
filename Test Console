@@ -1,0 +1,192 @@
+using System;
+using System.Configuration;
+using ABC.D365.Repository.Repositories;
+using Microsoft.Crm.Sdk.Messages;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+// ReSharper disable StringLiteralTypo
+// ReSharper disable UnusedVariable
+// ReSharper disable UnusedParameter.Local
+
+namespace ABC.D365.TestConsole
+{
+    class TestConsole
+    {
+        private static string _crmUrl;
+        private static string _crmUserName;
+        private static string _crmUserPassword;
+
+        static void Main(string[] args)
+        {
+            if (ConfigurationManager.AppSettings["CrmUrl"] != null)
+            {
+                _crmUrl = ConfigurationManager.AppSettings["CrmUrl"];
+            }
+
+            if (ConfigurationManager.AppSettings["CrmUserName"] != null)
+            {
+                _crmUserName = ConfigurationManager.AppSettings["CrmUserName"];
+            }
+
+            if (ConfigurationManager.AppSettings["CrmUserPassword"] != null)
+            {
+                _crmUserPassword = ConfigurationManager.AppSettings["CrmUserPassword"];
+            }
+
+            //TestAccountCreateDocumentLocation();
+            //TestOpportunityCreateDocumentLocation();
+            //TestAccountDeactivateQuotesOnMerge();
+            GetDependencyForDelete();
+        }
+
+        private static void TestAccountCreateDocumentLocation()
+        {
+            var documentLocationRepository = new DocumentLocationRepository(_crmUrl, _crmUserName, _crmUserPassword);
+
+            var accountReference = new EntityReference("account", new Guid("dae1540b-2b1d-eb11-a813-000d3a19fda1"));
+
+            //Retrieve account's name
+            Entity accountDetails = documentLocationRepository.Retrieve(accountReference.LogicalName, accountReference.Id, new ColumnSet(new string[] { "name", "accountid" }));
+
+            EntityCollection accountSharepointDocLocation = documentLocationRepository.GetAccountDocumentLocationByRelativeUrl("account");
+            if (accountSharepointDocLocation.Entities.Count != 1)
+            {
+                if (accountSharepointDocLocation.Entities.Count == 0)
+                { throw new Exception("No active account SharePoint document store found."); }
+                else if (accountSharepointDocLocation.Entities.Count > 1)
+                { throw new Exception("More than one active account SharePoint document store found."); }
+            }
+
+            //Generate RelativeURL the URL
+            string accountName = accountDetails.Attributes["name"].ToString();
+            string accountNameClean = documentLocationRepository.CleanName(accountName, false);
+
+
+            string accountId = accountDetails.GetAttributeValue<Guid>("accountid").ToString();
+            accountId = documentLocationRepository.CleanId(accountId);
+
+            string relativeUrl = accountNameClean + "_" + accountId;
+
+            //Create Account Document Location Record in Dynamics
+            //NOTE:  Power App Flow will create the actual SharePoint folders after this record is created.
+            Entity accountDocumentLocation = new Entity("sharepointdocumentlocation");
+            accountDocumentLocation.Attributes.Add("name", accountName + " document location");
+            accountDocumentLocation.Attributes.Add("parentsiteorlocation", new EntityReference("sharepointdocumentlocation", accountSharepointDocLocation.Entities[0].Id));
+            accountDocumentLocation.Attributes.Add("relativeurl", relativeUrl);
+            accountDocumentLocation.Attributes.Add("regardingobjectid", new EntityReference("account", accountDetails.Id));
+            documentLocationRepository.Save(accountDocumentLocation);
+        }
+
+        private static void TestOpportunityCreateDocumentLocation()
+        {
+            var environmentString = "dev";
+
+            //Create the tracing service
+            try
+            {
+                var documentLocationRepository = new DocumentLocationRepository(_crmUrl, _crmUserName, _crmUserPassword);
+                var opportunityReference = new EntityReference("opportunity", new Guid("844e147f-7e99-4d0c-8318-5af0f259bd90"));
+
+                //Retrieve Opportunity's related Account
+                Entity opportunityDetails = documentLocationRepository.Retrieve(opportunityReference.LogicalName, opportunityReference.Id, new ColumnSet(new string[] { "name", "parentaccountid", "opportunityid" }));
+
+                //Manipulate the Account Name and ID Fields for the SharePoint URL
+                string accountName = opportunityDetails.GetAttributeValue<EntityReference>("parentaccountid").Name;
+                string accountNameClean = documentLocationRepository.CleanName(accountName, false);
+
+
+                string accountId = opportunityDetails.GetAttributeValue<EntityReference>("parentaccountid").Id.ToString();
+                string accountIdClean = accountId;
+                accountIdClean = documentLocationRepository.CleanId(accountIdClean);
+
+
+                //Manipulate the Opportunity Name and ID Fields for the SharePoint URL
+                //Create the Opportunity SharePoint URL link to be stored on the Opportunity Record in the "nd_opportunitysharepointurl" field.
+                //This field will be displayed on all of the Opportunity's related requests.
+                string opportunityName = opportunityDetails.GetAttributeValue<string>("name");
+                string opportunityNameClean = documentLocationRepository.CleanName(opportunityName, false);
+
+                string opportunityId = opportunityDetails.GetAttributeValue<Guid>("opportunityid").ToString();
+                opportunityId = documentLocationRepository.CleanId(opportunityId);
+
+                string opportunityUrl = @"https://genequip0.sharepoint.com/sites/D365DocumentStorage/" + environmentString + "/account/" + accountNameClean + "_" + accountIdClean + "/opportunity/" + opportunityNameClean + "_" + opportunityId;
+
+
+                var updateOpportunity = new Entity(opportunityReference.LogicalName){Id = opportunityReference.Id};
+                updateOpportunity.Attributes.Add("nd_opportunitysharepointurl", opportunityUrl);
+                documentLocationRepository.Save(updateOpportunity);
+
+
+                //Find or Create the Account's Opportunity folder document location
+                EntityCollection accountOpportunityFolderSharepointDocLocation = documentLocationRepository.GetAccountOpportunityFolderLocation("opportunity", accountId);
+                Guid accountOpportunityFolderDocLocationId = Guid.Empty;
+
+                if (accountOpportunityFolderSharepointDocLocation.Entities.Count != 1)
+                {
+                    if (accountOpportunityFolderSharepointDocLocation.Entities.Count == 0)
+                    {
+                        try
+                        {
+                            //If not found create it.
+                            //Get the accounts Document Folder Location
+
+                            EntityCollection accountDocLocation = documentLocationRepository.GetAccountDocumentLocationFolderId(accountIdClean);
+                            Guid accountDocLocationId = accountDocLocation.Entities[0].Id;
+                            accountOpportunityFolderDocLocationId = documentLocationRepository.CreateDocumentLocation(accountName + "'s opportunity folder", "opportunity", accountDocLocationId, null);
+                        }
+                        catch (Exception ex)
+                        {
+                            throw;
+                        }
+                    }
+                    else if (accountOpportunityFolderSharepointDocLocation.Entities.Count > 1)
+                    {
+                        throw new Exception("More than one active opportunity folder found for this account. " + accountName);
+                    }
+                }
+                else
+                {
+                    accountOpportunityFolderDocLocationId = accountOpportunityFolderSharepointDocLocation.Entities[0].Id;
+                }
+
+                //Create Opportunity Document Location Record in Dynamics
+                //Note:  Power App Flow will create the actual SharePoint folders after this record is created.
+                EntityReference regardingObject = new EntityReference("opportunity", opportunityDetails.Id);
+                string relativeUrl = opportunityNameClean + "_" + opportunityId;
+
+                documentLocationRepository.CreateDocumentLocation(opportunityNameClean, relativeUrl, accountOpportunityFolderDocLocationId, regardingObject);
+                
+            }
+            catch (Exception ex)
+            {
+                throw;
+            }
+        }
+
+        private static void TestAccountDeactivateQuotesOnMerge()
+        {
+            var accountReference = new EntityReference("account", new Guid("ddf2b7e6-ce14-ed11-b83d-0022482236bb"));
+
+            var accountRepository = new AccountRepository(_crmUrl, _crmUserName, _crmUserPassword);
+
+            var activeQuotes = accountRepository.GetActiveQuotesForAccount(accountReference);
+
+            foreach (var activeQuote in activeQuotes.Entities)
+            {
+                // Set quote to Draft
+                accountRepository.SetState(activeQuote, 0, 1);
+            }
+        }
+
+        private static void GetDependencyForDelete()
+        {
+            var accountRepositry = new AccountRepository(_crmUrl, _crmUserName, _crmUserPassword);
+
+            var retrieveDependenciesForDeleteRequest = new RetrieveDependenciesForDeleteRequest();
+            retrieveDependenciesForDeleteRequest.ComponentType = 20;
+            retrieveDependenciesForDeleteRequest.ObjectId = new Guid("2548e136-b041-ee11-bdf3-00224827b1d6");
+
+            var response = accountRepositry.Execute(retrieveDependenciesForDeleteRequest);
+        }
+    }
+}
