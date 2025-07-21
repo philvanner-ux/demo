@@ -1,0 +1,163 @@
+using ABC.D365.Repository.Repositories;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace ABC.D365.Plugins.QuoteProduct
+{
+    public class PreUpdateQuoteProductFields : IPlugin
+
+    {
+        public void Execute(IServiceProvider serviceProvider)
+        {
+            try
+            {
+                IPluginExecutionContext context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
+                IOrganizationServiceFactory serviceFactory =
+                    (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));
+                IOrganizationService service = serviceFactory.CreateOrganizationService(context.UserId);
+
+                //This code is here to stop a loop from happening when updating the FOB Field on all items in a Set
+                if (context.Depth > 1)
+                    return;
+
+                if (context.InputParameters.Contains("Target") && context.InputParameters["Target"] is Entity)
+                {
+                    Entity entity = (Entity)context.InputParameters["Target"];
+                    Money rentalPriceMoney;
+                    if (entity.LogicalName == "quotedetail")
+                    {
+                        if (entity.Attributes.Contains("ges_rentalrateprice") || entity.Attributes.Contains("nd_sellamount"))
+                        {
+                            //Don't allow Wear,PM,Snow program rates to be overwritten outside of the "Program Hour" and "Program Hourly Rate" fields.
+                            Entity entitydetail = service.Retrieve("quotedetail", entity.Id, new ColumnSet(new string[] {"nd_programhours", "nd_programhourlyrate", "nd_quotelinetype"}));
+
+                            if (entitydetail.Attributes.Contains("nd_programhours") && entitydetail.Attributes.Contains("nd_programhourlyrate"))
+                            {
+                                decimal programAmount = Convert.ToInt32(entitydetail["nd_programhours"]) * ((Money)entitydetail["nd_programhourlyrate"]).Value;
+                                rentalPriceMoney = new Money(programAmount);
+                                entity.Attributes["ges_rentalrateprice"] = rentalPriceMoney;
+                            }
+                            else
+                            {
+                                if (entity.Contains("ges_rentalrateprice") && ((Money)entity["ges_rentalrateprice"]).Value != 0)
+                                {
+                                    if (entitydetail.Attributes.Contains("nd_quotelinetype") && ((OptionSetValue)entitydetail["nd_quotelinetype"]).Value == 899200002 && ((Money)entity["ges_rentalrateprice"]).Value > 0)
+                                    {
+                                        //899200002 = Down Payment and should be subtracted from subtotal.
+                                        rentalPriceMoney = (Money)entity["ges_rentalrateprice"];
+                                        //Make the rental Price Negative
+                                        rentalPriceMoney.Value = -rentalPriceMoney.Value;
+                                        entity.Attributes["ges_rentalrateprice"] = rentalPriceMoney;
+                                    }
+                                    else
+                                    {
+                                        // Get the current attribute value
+                                        rentalPriceMoney = (Money)entity["ges_rentalrateprice"];
+                                    }
+                                }
+                                else if (entity.Contains("nd_sellamount") && ((Money)entity["nd_sellamount"]).Value != 0)
+                                {
+                                    if (entitydetail.Attributes.Contains("nd_quotelinetype") && (((OptionSetValue)entitydetail["nd_quotelinetype"]).Value == 899200002 || ((OptionSetValue)entitydetail["nd_quotelinetype"]).Value == 899200004) && ((Money)entity["nd_sellamount"]).Value > 0)
+                                    {
+                                        //899200002 = Down Payment and should be subtracted from subtotal.
+                                        //899200004 = Trade_In and should be subtracted from subtotal.
+                                        rentalPriceMoney = (Money)entity["nd_sellamount"];
+                                        //Make the rental Price Negative
+                                        rentalPriceMoney.Value = -rentalPriceMoney.Value;
+                                        entity.Attributes["nd_sellamount"] = rentalPriceMoney;
+                                    }
+                                    else
+                                    {
+                                        // Get the current attribute value
+                                        rentalPriceMoney = (Money)entity["nd_sellamount"];
+                                    }
+                                }
+                                else
+                                    rentalPriceMoney = new Money(new decimal(0.00));
+                            }
+
+                            // Update price per unit
+                            if (entity.Attributes.Contains("priceperunit"))
+                            {
+                                entity.Attributes["priceperunit"] = rentalPriceMoney;
+                            }
+                            else
+                            {
+                                entity.Attributes.Add("priceperunit", rentalPriceMoney);
+                            }
+                        }
+                        //The fobPoint has updated.  If the quote has delivery Terms of FD1 update all of the Blank FOBPoint fields on products within the same set.
+                        //Also uppercase the fobPoint text
+                        if(entity.Attributes.Contains("nd_fobpoint"))
+                        {
+                            //Get the quote ID for the item in question
+                            Entity entitydetail = service.Retrieve("quotedetail", entity.Id, new ColumnSet(new string[] { "quoteid", "nd_set", "nd_equipmenttype" }));
+                            if (entitydetail.Contains("quoteid") && entitydetail.Contains("nd_set"))
+                            {
+                                Guid quoteId = entitydetail.GetAttributeValue<EntityReference>("quoteid").Id;
+                                string setNumber = entitydetail.Attributes["nd_set"].ToString();
+                                Entity quoteDetails = service.Retrieve("quote", quoteId, new ColumnSet(new string[] { "nd_deliveryterms", "ges_freighttermstojobsite" }));
+                                entity.Attributes["nd_fobpoint"] = entity.Attributes["nd_fobpoint"].ToString().ToUpper();
+                                int deliveryTermValue = 0;
+
+                                if (quoteDetails.Contains("nd_deliveryterms"))
+                                {
+                                    deliveryTermValue = ((OptionSetValue)quoteDetails.Attributes["nd_deliveryterms"]).Value;
+                                }
+                                else if (quoteDetails.Contains("ges_freighttermstojobsite"))
+                                {
+                                    deliveryTermValue = ((OptionSetValue)quoteDetails.Attributes["ges_freighttermstojobsite"]).Value;
+                                }
+
+                                if (deliveryTermValue == 277930002) //FD1
+                                {
+                                    var QuoteProductRepository = new QuoteProductRepository(service);
+                                    EntityCollection quoteLines = QuoteProductRepository.GetAllQuoteProducts(quoteId.ToString());
+
+                                    foreach (Entity QuoteLine in quoteLines.Entities)
+                                    {
+
+                                        //Only update the FOBPoint for products in the Set that are Attachments or Base Models
+                                        if (QuoteLine.Attributes.Contains("nd_equipmenttype") && (((OptionSetValue)QuoteLine["nd_equipmenttype"]).Value == 200000 || ((OptionSetValue)QuoteLine["nd_equipmenttype"]).Value == 200001))
+                                        {
+                                            if (QuoteLine.Attributes.Contains("nd_set") && QuoteLine.Attributes["nd_set"].ToString() == setNumber)
+                                            {
+                                                if (QuoteLine.Contains("nd_fobpoint") && String.IsNullOrEmpty(QuoteLine.Attributes["nd_fobpoint"].ToString()))
+                                                {
+                                                    QuoteLine.Attributes["nd_fobpoint"] = entity.Attributes["nd_fobpoint"].ToString().ToUpper();
+                                                    service.Update(QuoteLine);
+                                                }
+                                                else if (!QuoteLine.Contains("nd_fobpoint"))
+                                                {
+                                                    QuoteLine.Attributes.Add("nd_fobpoint", entity.Attributes["nd_fobpoint"].ToString().ToUpper());
+                                                    service.Update(QuoteLine);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else if(entitydetail.Contains("quoteid"))
+                            {
+                                //Just make sure that what was entered is in all caps.  This is for entry from the editable grid.
+                                entity.Attributes["nd_fobpoint"] = entity.Attributes["nd_fobpoint"].ToString().ToUpper();
+                            }
+                        }
+                    }
+                }
+
+            }
+            catch (InvalidPluginExecutionException e)
+            {
+                // catch exception
+                throw new InvalidPluginExecutionException("An error in UpdateQuoteProductPricePerUnit: " + e.Message);
+            }
+
+        }
+    }
+}
